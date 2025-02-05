@@ -22,6 +22,9 @@
 #include <stdbool.h>
 #include <sys/prctl.h>
 #include <argp.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/crypto.h>
 
 #include "dw_debug.h"
 #include "message.h"
@@ -35,6 +38,9 @@
 #include "dw_poll.h"
 
 #define MAX_EVENTS 10
+
+int ssl_enable = 0;
+SSL_CTX *server_ssl_ctx = NULL;
 
 static inline uint64_t i2l(uint32_t ln, uint32_t rn) {
     return ((uint64_t) ln) << 32 | rn;
@@ -328,6 +334,15 @@ command_t *single_start_forward(req_info_t *req, message_t *m, command_t *cmd, d
             dw_log("connecting to: %s:%d\n", inet_ntoa((struct in_addr) { addr.sin_addr.s_addr }),
                    ntohs(addr.sin_port));
 
+            if (ssl_enable && fwd.proto == TCP) {
+                if (conn_enable_ssl(fwd_conn_id, server_ssl_ctx, 0) < 0) {
+                    fprintf(stderr, "SSL_connect() failed on forward connection\n");
+                    close(clientSocket);
+                    conn_free(fwd_conn_id);
+                    return NULL;
+                }
+            }
+
             int rv = connect(clientSocket, &addr, sizeof(addr));
             if (rv == -1) {
                 if (errno != EAGAIN && errno != EINPROGRESS) {
@@ -337,11 +352,19 @@ command_t *single_start_forward(req_info_t *req, message_t *m, command_t *cmd, d
 
                 dw_log("connect(): %s\n", strerror(errno));
                 // normal case of asynchronous connect
-                conn_set_status_by_id(fwd_conn_id, CONNECTING);
+                if (ssl_enable && fwd.proto == TCP) {
+                    conn_set_status_by_id(fwd_conn_id, SSL_HANDSHAKE);
+                } else {
+                    conn_set_status_by_id(fwd_conn_id, CONNECTING);
+                }
             } else {
                 dw_log("connect(): Ready\n");
-                conn_set_status_by_id(fwd_conn_id, READY);
-                infos->active_conns++;
+                if (ssl_enable && fwd.proto == TCP) {
+                    conn_set_status_by_id(fwd_conn_id, SSL_HANDSHAKE);
+                } else {
+                    conn_set_status_by_id(fwd_conn_id, READY);
+                    infos->active_conns++;
+                }
             }
         }
     }
@@ -773,6 +796,17 @@ void exec_request(dw_poll_t *p_poll, dw_poll_flags pflags, int conn_id, event_t 
 
     dw_log("event_type=%s, conn_id=%d\n", get_event_str(type), conn_id);
 
+    if (conn->status == SSL_HANDSHAKE) {
+        int hs = conn_do_ssl_handshake(conn_id);
+        if (hs < 0)
+            goto err;
+        else if (hs == 0) {
+            /* handshake still in progress, do not proceed with send/recv */
+            return;
+        }
+        /* handshake is complete => status=READY => continue below */
+    }
+
     if (type == TIMER) {
         handle_timeout(p_poll, infos);
         return;
@@ -1103,7 +1137,19 @@ void* conn_worker(void* args) {
                     continue;
                 }
 
-                conn_set_status_by_id(conn_id, READY);
+                // if the user requested SSL (global variable below) enable it on newly accepted connections
+                extern int ssl_enable;
+                extern SSL_CTX *server_ssl_ctx;
+                if (ssl_enable && conns[conn_id].proto == TCP) {
+                    if (conn_enable_ssl(conn_id, server_ssl_ctx, 1) < 0) {
+                        fprintf(stderr, "SSL_accept() failed on incoming connection\n");
+                        close_and_forget(&infos->dw_poll, conn_sock);
+                        conn_free(conn_id);
+                        continue;
+                    }
+                } else
+                    conn_set_status_by_id(conn_id, READY);
+
                 infos->active_conns++;
                 
                 int next_thread_id = accept_mode == AM_PARENT ? (atomic_fetch_add(&next_thread_cnt, 1) % conn_threads) : (infos - conn_worker_infos);
@@ -1201,6 +1247,13 @@ enum argp_node_option_keys {
     ODIRECT,
     NO_DELAY,
     BACKLOG_LENGTH,
+    SSL_ENABLE,
+    SSL_CERT_FILE,
+    SSL_KEY_FILE,
+    SSL_CA_FILE,
+    SSL_CIPHERS,
+    SSL_CA_PATH,
+    SSL_VERIFY
 };
 
 struct argp_node_arguments {
@@ -1213,6 +1266,13 @@ struct argp_node_arguments {
     char* thread_affinity_list;
     int num_threads;
     struct sched_attr sched_attrs;
+    int ssl_enable;
+    char* ssl_cert;
+    char* ssl_key;
+    char* ssl_ca;
+    char* ssl_ciphers;
+    char* ssl_ca_path;
+    int ssl_verify;
 };
 
 static struct argp_option argp_node_options[] = {
@@ -1234,6 +1294,13 @@ static struct argp_option argp_node_options[] = {
     {"nd",                NO_DELAY,         "0|1", OPTION_ALIAS },
     {"help",              HELP,              0,                               0,  "Show this help message", 1 },
     {"usage",             USAGE,             0,                               0,  "Show a short usage message", 1 },
+    {"ssl",               SSL_ENABLE,        0,                               0,  "Enable SSL/TLS" },
+    {"ssl-cert",          SSL_CERT_FILE,     "FILE",                          0,  "Server SSL certificate file" },
+    {"ssl-key",           SSL_KEY_FILE,      "FILE",                          0,  "Server SSL key file" },
+    {"ssl-ca",            SSL_CA_FILE,       "FILE",                          0,  "Server SSL CA file" },
+    {"ssl-ciphers",       SSL_CIPHERS,       "CIPHERS",                       0,  "Allowed SSL ciphers" },
+    {"ssl-ca-path",       SSL_CA_PATH,       "DIR",                           0,  "Server SSL CA path" },
+    {"ssl-verify",        SSL_VERIFY,        0,                               0,  "Enable peer certificate verification"},
     { 0 }
 };
 
@@ -1341,6 +1408,27 @@ static error_t argp_node_parse_opt(int key, char *arg, struct argp_state *state)
             exit(EXIT_FAILURE);
         }
         break;
+    case SSL_ENABLE:
+        arguments->ssl_enable = 1;
+        break;
+    case SSL_CERT_FILE:
+        arguments->ssl_cert = arg;
+        break;
+    case SSL_KEY_FILE:
+        arguments->ssl_key = arg;
+        break;
+    case SSL_CA_FILE:
+        arguments->ssl_ca = arg;
+        break;
+    case SSL_CIPHERS:
+        arguments->ssl_ciphers = arg;
+        break;
+    case SSL_CA_PATH:
+        arguments->ssl_ca_path = arg;
+        break;
+    case SSL_VERIFY:
+        arguments->ssl_verify = 1;
+        break;
     default:
         return ARGP_ERR_UNKNOWN;
     }
@@ -1401,6 +1489,13 @@ int main(int argc, char *argv[]) {
     input_args.thread_affinity_list = NULL;    
     input_args.num_threads = 1;
     input_args.sched_attrs = (struct sched_attr) { .size = sizeof(struct sched_attr), .sched_policy = SCHED_OTHER, .sched_flags = 0 };
+    input_args.ssl_enable = 0;
+    input_args.ssl_cert = NULL;
+    input_args.ssl_key = NULL;
+    input_args.ssl_ca = NULL;
+    input_args.ssl_ciphers = NULL;
+    input_args.ssl_ca_path = NULL;
+    input_args.ssl_verify = 0;
 
     char *home_path = getenv("HOME");
     check(home_path != NULL && strlen(home_path) + 10 < sizeof(storage_worker_info.storage_info));
@@ -1464,6 +1559,54 @@ int main(int argc, char *argv[]) {
 
     conn_init();
     req_init();
+
+    // if --ssl was specified, create an SSL_CTX
+    ssl_enable = input_args.ssl_enable;
+    if (ssl_enable) {
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
+
+        server_ssl_ctx = SSL_CTX_new(TLS_method());
+        if (!server_ssl_ctx) {
+            fprintf(stderr, "Error: cannot create server SSL context\n");
+            exit(EXIT_FAILURE);
+        }
+        if (input_args.ssl_ca && input_args.ssl_ca[0]) {
+            if (!SSL_CTX_load_verify_locations(server_ssl_ctx, input_args.ssl_ca, NULL)) {
+                fprintf(stderr, "Error: cannot load CA file '%s'\n", input_args.ssl_ca);
+                exit(EXIT_FAILURE);
+            }
+        }
+        if (input_args.ssl_ca_path && input_args.ssl_ca_path[0]) {
+            if (!SSL_CTX_load_verify_locations(server_ssl_ctx, NULL, input_args.ssl_ca_path)) {
+                fprintf(stderr, "Error: cannot load CA path '%s'\n", input_args.ssl_ca_path);
+                exit(EXIT_FAILURE);
+            }
+        }
+        if (input_args.ssl_cert && input_args.ssl_cert[0]) {
+            if (SSL_CTX_use_certificate_file(server_ssl_ctx, input_args.ssl_cert, SSL_FILETYPE_PEM) <= 0) {
+                fprintf(stderr, "Error: cannot load cert file '%s'\n", input_args.ssl_cert);
+                exit(EXIT_FAILURE);
+            }
+        }
+        if (input_args.ssl_key && input_args.ssl_key[0]) {
+            if (SSL_CTX_use_PrivateKey_file(server_ssl_ctx, input_args.ssl_key, SSL_FILETYPE_PEM) <= 0) {
+                fprintf(stderr, "Error: cannot load key file '%s'\n", input_args.ssl_key);
+                exit(EXIT_FAILURE);
+            }
+        }
+        if (input_args.ssl_ciphers && input_args.ssl_ciphers[0]) {
+            if (!SSL_CTX_set_cipher_list(server_ssl_ctx, input_args.ssl_ciphers)) {
+                fprintf(stderr, "Error: cannot set the desired SSL ciphers '%s'\n", input_args.ssl_ciphers);
+                exit(EXIT_FAILURE);
+            }
+        }
+        if (input_args.ssl_enable && input_args.ssl_verify) {
+            SSL_CTX_set_verify(server_ssl_ctx, SSL_VERIFY_PEER, NULL);
+            SSL_CTX_set_verify_depth(server_ssl_ctx, 100);
+        }
+    }
 
     // Open storage file, if any
     if (storage_worker_info.storage_info.storage_path[0] != '\0') {
@@ -1613,6 +1756,12 @@ int main(int argc, char *argv[]) {
             close(conn_worker_infos[i].dispatchfd[0]);
             close(conn_worker_infos[i].dispatchfd[1]);
         }
+    }
+
+    // cleanup server SSL context if allocated
+    if (server_ssl_ctx) {
+        SSL_CTX_free(server_ssl_ctx);
+        server_ssl_ctx = NULL;
     }
 
     return 0;
